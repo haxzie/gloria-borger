@@ -1,25 +1,14 @@
-const getConfig = require('probot-config');
 const addLabel = require('./lib/create_label');
-const axios = require('axios');
 const sendMail = require('./lib/email_sender');
-
-/**
- * Function to check if a key is present in the labels object list
- * @param {String} key 
- * @param {Array<String>} labels 
- */
-const checkForLabel = (key, labels) => {
-  if (labels && labels.length > 0) {
-    // loop through all the label anmes
-    labels.forEach(element => {
-      if (element.name === key) {
-        return true;
-      }
-    });
-  }
-
-  return false;
-}
+const {
+  getRepoConfig,
+  checkIfAdmin,
+  getLabels,
+  validateEmail,
+  obfuscateEmail
+} = require('./lib/utils');
+const showdown = require('showdown');
+const converter = new showdown.Converter();
 
 /**
  * This is the main entrypoint to your Probot app
@@ -28,86 +17,77 @@ const checkForLabel = (key, labels) => {
 module.exports = app => {
   // Your code here
   app.log('Yay, the app was loaded!');
+  console.log(process.env.NODE_ENV);
+
+  app.on('issue.opened', async context => {
+    console.log(context.payload.issue.title);
+    console.log(context.payload.issue.body);
+  });
 
   app.on('issue_comment.created', async context => {
-    let config = await getConfig(context, 'config.yml');
-    console.log(config);
-  });
+    console.log('ISSUE_COMMENT.CREATED');
+    const comment = context.payload.comment;
+    const comment_id = comment.id;
+    const user = comment.user.login;
+    const { number, labels, title, body } = context.payload.issue;
+    const { admins, email_recipients } = await getRepoConfig(context);
 
-  app.on('pull_request.merged', async context => {
-    const pullRequest = context.payload.pull_request;
-    const creator = pullRequest.user.login;
-    const number = pullRequest.number;
-    const labels = pullRequest.labels;
-    
-    // get the list of changed/new files
-    const filesList = await context.github.pullRequests.listFiles(context.issue({
-      number: number
-    }));
+    // functionality only available for admins
+    // return otherwise
+    if (!checkIfAdmin(user, admins))
+      return;
 
-    // get the config data
-    const config = await getConfig(context, 'config.yml');
-    const { email_recipients } = config;
+    // check if the command is to approve a PR
+    if (comment.body.match(/^\/approve$/)) {
+      return await addLabel(context, number, 'Approved');
+    }
 
+    // check if the command is to send email
+    if (comment.body.match(/^\/mail\sto\s(.*)$/)) {
+      const mailGroup = comment.body.split(' ')[2];
+      let recipientName = mailGroup;
+      let emails = email_recipients[mailGroup];
 
-    // check if the pull request is for a single file
-    if (filesList.data.length == 1) {
-      // take the first file from the PR
-      let file = filesList.data[0];
-      // check if the PR is for emails 
-      if (file.filename.match(/^emails\//g) && checkForLabel('approved', labels)) {
-        //set the label of the PR to email
-        await addLabel(context, number, 'SUCCESS');
-        // get the contents of the file
-        const { data } = await axios.get(file.raw_url);
-        console.log(data);
-        sendMail(context, email_recipients, pullRequest.title, data);
+      // check if the provided string is a valid email
+      // if yes, use that to send the mail to
+      if (validateEmail(mailGroup)) {
+        console.log('Requested to mail to an email ID');
+        emails = [mailGroup];
+        recipientName = obfuscateEmail(mailGroup);
+        // delete the mail address from comments for privacy concerns
+        try {
+          await context.github.issues.deleteComment(context.issue({
+            comment_id
+          }));
+          console.log(`Deleted comment ${comment_id} successfully`);
+        } catch( err ) {
+          console.error(`Unable to delete the comment: ${ comment_id }`);
+        }
+      
+      } else if (!emails || emails.length < 1) {
+        // return if the provided ,ail group isn't present in the config file
+        return await context.github.issues.createComment(context.issue({
+          body: `Uh oh! I coudn't find any emails under the email group '${mailGroup}' in the config file.
+          check if the entry is present inside .github/news-room.yml file of this repo.
+          `
+        }));
       }
-      // check if the PR is for a new tweet
-      else if (file.filename.match(/^tweets\//g) && checkForLabel('approved', labels)) {
-        //set the label of the PR to tweet
-        await addLabel(context, number, 'SUCCESS');
-        //  get the contents of the file
-        const { data } = await axios.get(file.raw_url);
-        console.log(data);
+
+      // check if the issue is approved
+      const labelNames = getLabels(labels);
+      if (!labelNames.includes('Approved')) {
+        return await context.github.issues.createComment(context.issue({
+          body: `Hold Up! this issue isn't approved yet. Request an admin to approve this issue or if you are an admin, comment \`/approve\` to approve this issue.`
+        }));
       }
+
+      // get the email subeject from the issue title
+      const emailSubject = title;
+      // generate the HTML content of the body from the issue body (Markdown)
+      const emailBody = converter.makeHtml(body);
+      
+      sendMail(context, emails, emailSubject, emailBody, recipientName);
     }
 
   });
-
-  app.on('pull_request.opened', async context => {
-    const pullRequest = context.payload.pull_request;
-    const creator = pullRequest.user.login;
-    const number = pullRequest.number;
-
-    // get the list of changed/new files
-    const filesList = await context.github.pullRequests.listFiles(context.issue({
-      number: number
-    }));
-
-    // check if the pull request is for a single file
-    if (filesList.data.length == 1) {
-      // take the first file from the PR
-      let file = filesList.data[0];
-      // check if the PR is for emails 
-      if (file.filename.match(/^emails\//g)) {
-        //set the label of the PR to email
-        await addLabel(context, number, 'email');
-      }
-      // check if the PR is for a new tweet
-      else if (file.filename.match(/^tweets\//g)) {
-        //set the label of the PR to tweet
-        await addLabel(context, number, 'tweet');
-        //  get the contents of the file
-        const { data } = await axios.get(file.raw_url);
-        console.log(data);
-      }
-    }
-  })
-
-  // For more information on building apps:
-  // https://probot.github.io/docs/
-
-  // To get your app running against GitHub, see:
-  // https://probot.github.io/docs/development/
 }
